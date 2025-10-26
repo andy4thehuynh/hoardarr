@@ -1,0 +1,757 @@
+# Hoardarr Database Schema
+
+## Couchbase Capella Setup
+
+**Bucket**: `hoardarr`
+
+**Collections**:
+- `reddit_content` - Saved Reddit posts and comments
+- `github_stars` - Starred GitHub repositories  
+- `tiktok_favorites` - Favorited TikTok videos
+- `sync_metadata` - OAuth tokens and sync state
+
+**Vector Index**: `content_vector_index`
+- Dimensions: 1536
+- Similarity: cosine
+- Field: `embedding`
+- Applies to all content collections
+
+---
+
+## Schema Definitions
+
+### reddit_content
+```json
+{
+  "_type": "reddit_saved",
+  "id": "abc123",
+  "name": "t3_abc123",
+  "kind": "t3",
+  "title": "Cool programming article",
+  "selftext": "Article body text...",
+  "body": "",
+  "subreddit": "programming",
+  "permalink": "/r/programming/comments/abc123/cool_article",
+  "created_utc": 1698765432.0,
+  "url": "https://example.com/article",
+  "score": 234,
+  "embedding": [0.123, -0.456, ...],
+  "user_id": "reddit_username",
+  "synced_at": "2025-10-17T12:00:00Z"
+}
+```
+
+**Key for filtering**: `subreddit`
+**Vectorized**: `title` (or `title + selftext` or `body` for comments)
+
+---
+
+### github_stars
+```json
+{
+  "_type": "github_star",
+  "id": 1296269,
+  "full_name": "octocat/Hello-World",
+  "name": "Hello-World",
+  "description": "My first repository on GitHub",
+  "topics": ["api", "octocat", "tutorial"],
+  "html_url": "https://github.com/octocat/Hello-World",
+  "language": "JavaScript",
+  "stargazers_count": 80,
+  "starred_at": "2025-01-15T10:30:00Z",
+  "embedding": [0.234, -0.567, ...],
+  "user_id": "github_username",
+  "synced_at": "2025-10-17T12:00:00Z"
+}
+```
+
+**Key for filtering**: `topics` (array)
+**Vectorized**: `name: description`
+
+---
+
+### tiktok_favorites
+```json
+{
+  "_type": "tiktok_favorite",
+  "video_id": "1234567890123456789",
+  "link": "https://www.tiktok.com/@user/video/1234567890123456789",
+  "favorited_at": "2024-10-15T14:23:45Z",
+  "caption": "Check out this cool trick! #fyp #tutorial",
+  "video_description": "Learn this amazing technique...",
+  "author_username": "creator_name",
+  "author_nickname": "Creator Display Name",
+  "hashtags": ["fyp", "tutorial", "cool"],
+  "music_title": "Original Sound - creator_name",
+  "like_count": 12500,
+  "comment_count": 450,
+  "view_count": 125000,
+  "embedding": [0.345, -0.678, ...],
+  "user_id": "tiktok_username",
+  "uploaded_at": "2025-10-17T12:00:00Z",
+  "metadata_fetched_at": "2025-10-17T12:05:00Z"
+}
+```
+
+**Key for filtering**: `hashtags` (array)
+**Vectorized**: `caption + video_description + hashtags`
+
+---
+
+### sync_metadata
+```json
+{
+  "_type": "sync_status",
+  "provider": "reddit",
+  "user_id": "reddit_username",
+  "last_sync_at": "2025-10-17T12:00:00Z",
+  "last_full_reconciliation": "2025-10-10T12:00:00Z",
+  "sync_count": 5,
+  "access_token": "encrypted_token_here",
+  "refresh_token": "encrypted_refresh_token"
+}
+```
+
+**Document key pattern**: `{provider}:{user_id}`
+
+---
+
+## Query Patterns
+
+### Get all Reddit content for user
+```python
+query = """
+SELECT * FROM hoardarr._default.reddit_content 
+WHERE user_id = $1
+ORDER BY created_utc DESC
+LIMIT 50 OFFSET $2
+"""
+result = cluster.query(query, user_id, offset)
+```
+
+---
+
+### Filter Reddit by subreddit
+```python
+query = """
+SELECT * FROM hoardarr._default.reddit_content 
+WHERE user_id = $1 AND subreddit = $2
+ORDER BY created_utc DESC
+"""
+result = cluster.query(query, user_id, subreddit)
+```
+
+---
+
+### Filter GitHub by topic
+```python
+query = """
+SELECT * FROM hoardarr._default.github_stars 
+WHERE user_id = $1 AND ANY topic IN topics SATISFIES topic = $2 END
+ORDER BY starred_at DESC
+"""
+result = cluster.query(query, user_id, topic)
+```
+
+---
+
+### Vector Search Across All Collections
+```python
+from couchbase.search import SearchRequest, VectorSearch, VectorQuery
+
+search_req = SearchRequest.create(
+    VectorSearch.from_vector_query(
+        VectorQuery(
+            "embedding",
+            query_vector,
+            num_candidates=15
+        )
+    )
+).with_limit(5)
+
+# Add user filter
+search_req.with_filter(f'user_id:"{user_id}"')
+
+result = cluster.search_query(
+    "content_vector_index",
+    search_req
+)
+```
+
+---
+
+## Vector Index Setup (Manual)
+
+In Couchbase Capella UI:
+
+1. Go to Search → Add Index
+2. Name: `content_vector_index`
+3. Type: Vector Search
+4. Collections: Select all three content collections
+5. Vector Field Configuration:
+   - Field: `embedding`
+   - Dimensions: 1536
+   - Similarity: cosine
+6. Add filter field: `user_id` (keyword)
+7. Create Index
+
+---
+
+## Data Maintenance
+
+### Delete user's data
+```python
+# Delete from all collections
+for collection in ['reddit_content', 'github_stars', 'tiktok_favorites', 'sync_metadata']:
+    query = f"""
+    DELETE FROM hoardarr._default.{collection}
+    WHERE user_id = $1
+    """
+    cluster.query(query, user_id)
+```
+
+### Get sync statistics
+```python
+query = """
+SELECT 
+  (SELECT COUNT(*) FROM hoardarr._default.reddit_content WHERE user_id = $1)[0] as reddit_count,
+  (SELECT COUNT(*) FROM hoardarr._default.github_stars WHERE user_id = $1)[0] as github_count,
+  (SELECT COUNT(*) FROM hoardarr._default.tiktok_favorites WHERE user_id = $1)[0] as tiktok_count
+"""
+result = cluster.query(query, user_id)
+```
+# ========================================
+# docs/implementation-tasks.md
+# ========================================
+
+# Hoardarr Implementation Tasks
+
+**Total Duration**: ~4 weeks (1-2 hours per task)
+
+---
+
+## Week 1: Backend Foundation
+
+### Task 1: Basic Flask Setup ⏱️ 1-2 hours
+
+**Goal**: Get Flask running with health check.
+
+**What to build**:
+- `backend/app.py` - Flask app initialization
+- `backend/config.py` - Load environment variables
+- Health check endpoint
+
+**Files to create**:
+- `app.py`
+- `config.py`
+
+**Success criteria**:
+```bash
+python app.py
+# Visit http://localhost:5000/health
+# Should return: {"status": "healthy"}
+```
+
+**Ask Claude Code**:
+```
+"Guide me through creating app.py with Flask basics.
+I'll write the code, you review each part."
+```
+
+---
+
+### Task 2: Couchbase Connection ⏱️ 2-3 hours
+
+**Goal**: Connect to Couchbase Capella.
+
+**What to build**:
+- `services/couchbase_service.py`
+- Methods: connect, store, query, delete
+
+**Reference**: `docs/database.md`
+
+**Success criteria**:
+```python
+# test_couchbase.py
+from services.couchbase_service import CouchbaseService
+
+db = CouchbaseService()
+db.connect()
+doc = {"test": "data", "user_id": "test_user"}
+db.store("reddit_content", doc)
+print("Success!")
+```
+
+**Ask Claude Code**:
+```
+"I need to implement CouchbaseService.
+Guide me through connection setup and CRUD operations."
+```
+
+---
+
+### Task 3: Base Provider Abstraction ⏱️ 1 hour
+
+**Goal**: Create provider base classes.
+
+**What to build**:
+- `providers/base_provider.py`
+- `providers/api_provider.py` (extends BaseProvider)
+- `providers/file_upload_provider.py` (extends BaseProvider)
+
+**Reference**: `docs/providers.md`
+
+**Success criteria**:
+```python
+# Try creating test provider
+class TestProvider(APIProvider):
+    pass
+
+# Should fail - abstract methods not implemented
+```
+
+**Ask Claude Code**:
+```
+"Help me understand abstract base classes in Python.
+Then guide me through creating BaseProvider."
+```
+
+---
+
+### Task 4: Reddit OAuth Flow ⏱️ 3-4 hours
+
+**Goal**: Implement Reddit OAuth end-to-end.
+
+**What to build**:
+- `routes/auth.py` (Reddit endpoints)
+- Token encryption utility
+- Store tokens in Couchbase
+
+**Reference**: `docs/providers.md` (Reddit section)
+
+**Success criteria**:
+```bash
+# 1. Visit http://localhost:5000/api/auth/reddit
+# 2. Authorize on Reddit
+# 3. Redirected back successfully
+# 4. Check Couchbase: sync_metadata document exists
+```
+
+**Ask Claude Code**:
+```
+"I'm implementing Reddit OAuth.
+Walk me through the flow step by step."
+```
+
+---
+
+### Task 5: Reddit Provider ⏱️ 3-4 hours
+
+**Goal**: Fetch Reddit saved items.
+
+**What to build**:
+- `providers/reddit_provider.py`
+- Implement all abstract methods
+- Handle pagination
+
+**Reference**: `docs/providers.md` (Reddit implementation)
+
+**Success criteria**:
+```python
+# test_reddit_provider.py
+provider = RedditProvider()
+items = provider.fetch_items(access_token)
+print(f"Fetched {len(items)} items")
+
+# Verify:
+# - Items have correct structure
+# - Pagination works
+# - Both posts and comments handled
+```
+
+**Ask Claude Code**:
+```
+"I need to implement RedditProvider.fetch_items() with pagination.
+Show me the structure, I'll write it."
+```
+
+---
+
+## Week 2: Vectorization & Sync
+
+### Task 6: Embedding Service ⏱️ 2 hours
+
+**Goal**: Integrate OpenAI embeddings.
+
+**What to build**:
+- `services/embedding_service.py`
+- Handle rate limits and errors
+- Batch processing
+
+**Reference**: `docs/vectorization.md`
+
+**Success criteria**:
+```python
+# test_embeddings.py
+embedder = EmbeddingService(api_key)
+text = "Test text for embedding"
+embedding = embedder.embed(text)
+
+print(f"Dimensions: {len(embedding)}")  # Should be 1536
+```
+
+**Ask Claude Code**:
+```
+"Guide me through implementing OpenAI embedding service.
+How should I handle errors and rate limits?"
+```
+
+---
+
+### Task 7: Vectorizer Service ⏱️ 2 hours
+
+**Goal**: Coordinate vectorization pipeline.
+
+**What to build**:
+- `services/vectorizer.py`
+- Text preprocessing
+- Coordinate provider + embedder
+
+**Reference**: `docs/vectorization.md`
+
+**Success criteria**:
+```python
+# Test full pipeline
+vectorizer = Vectorizer(embedding_service)
+item = reddit_provider.fetch_items()[0]
+db_doc = vectorizer.vectorize_item(reddit_provider, item)
+
+# Verify db_doc has:
+# - All required fields
+# - 1536-dim embedding
+```
+
+**Ask Claude Code**:
+```
+"Help me implement Vectorizer that ties together
+provider text extraction and embedding service."
+```
+
+---
+
+### Task 8: Sync Orchestration ⏱️ 4-5 hours
+
+**Goal**: Implement delta sync + reconciliation.
+
+**What to build**:
+- `routes/sync.py`
+- Delta sync logic
+- Full reconciliation every 10th sync
+
+**Reference**: `docs/sync-strategy.md`
+
+**Success criteria**:
+```bash
+# Trigger sync
+curl -X POST http://localhost:5000/api/sync/reddit \
+  -d '{"user_id": "username"}'
+
+# Verify:
+# - Items in Couchbase with embeddings
+# - sync_metadata updated
+# - Trigger again - should be fast (delta sync)
+# - On 10th sync - reconciliation runs
+```
+
+**Ask Claude Code**:
+```
+"I need to implement sync orchestration with delta sync.
+Walk me through the algorithm step by step."
+```
+
+---
+
+## Week 3: GitHub & RAG
+
+### Task 9: GitHub OAuth & Provider ⏱️ 3-4 hours
+
+**Goal**: Add GitHub as second provider.
+
+**What to build**:
+- GitHub OAuth in `routes/auth.py`
+- `providers/github_provider.py`
+
+**Reference**: `docs/providers.md` (GitHub section)
+
+**Success criteria**:
+```bash
+# 1. OAuth flow works
+# 2. Sync works
+curl -X POST http://localhost:5000/api/sync/github \
+  -d '{"user_id": "github_user"}'
+
+# 3. Verify items in Couchbase
+```
+
+**Ask Claude Code**:
+```
+"I'm adding GitHub provider following the Reddit pattern.
+Help me identify GitHub-specific differences."
+```
+
+---
+
+### Task 10: Content Retrieval Routes ⏱️ 2-3 hours
+
+**Goal**: API to list content with filters.
+
+**What to build**:
+- `routes/content.py`
+- Endpoints for Reddit, GitHub
+- Filtering (subreddit, topic)
+- Pagination
+
+**Reference**: `docs/api-endpoints.md`
+
+**Success criteria**:
+```bash
+# Get Reddit content
+curl "http://localhost:5000/api/content/reddit?user_id=alice&subreddit=programming"
+
+# Get GitHub stars
+curl "http://localhost:5000/api/content/github?user_id=bob&topic=python"
+
+# Both return paginated, filtered results
+```
+
+**Ask Claude Code**:
+```
+"Guide me through implementing content retrieval endpoints
+with filtering and pagination."
+```
+
+---
+
+### Task 11: Vector Search Setup ⏱️ 1-2 hours
+
+**Goal**: Create and test vector index.
+
+**Manual steps**:
+1. Create `content_vector_index` in Couchbase UI
+2. Test vector search queries
+
+**What to build**:
+- Vector search method in `couchbase_service.py`
+
+**Reference**: `docs/database.md` (Vector Search section)
+
+**Success criteria**:
+```python
+# test_vector_search.py
+query_embedding = embedder.embed("Python tutorials")
+results = db.vector_search(
+    "content_vector_index",
+    query_embedding,
+    top_k=5,
+    user_id="test_user"
+)
+
+print(f"Found {len(results)} similar items")
+# Should return relevant items
+```
+
+**Ask Claude Code**:
+```
+"Help me understand Couchbase vector search syntax.
+How do I query with filters?"
+```
+
+---
+
+### Task 12: RAG Service ⏱️ 3-4 hours
+
+**Goal**: Implement chat with Claude.
+
+**What to build**:
+- `services/rag_service.py`
+- `routes/chat.py`
+- Context building
+- Claude integration
+
+**Reference**: `docs/vectorization.md` (RAG section)
+
+**Success criteria**:
+```bash
+curl -X POST http://localhost:5000/api/chat \
+  -d '{"user_id": "alice", "message": "What Python content did I save?"}'
+
+# Should return:
+# - Relevant response from Claude
+# - Source citations (Reddit posts, GitHub repos)
+```
+
+**Ask Claude Code**:
+```
+"Guide me through implementing RAG with Claude.
+How should I structure the prompt and context?"
+```
+
+---
+
+## Week 4: TikTok & Frontend
+
+### Task 13: TikTok Provider ⏱️ 4-5 hours
+
+**Goal**: Handle TikTok file uploads.
+
+**What to build**:
+- `providers/tiktok_provider.py`
+- `routes/upload.py`
+- Metadata fetching
+
+**Reference**: `docs/providers.md` (TikTok section)
+
+**Success criteria**:
+```bash
+# Upload user_data.json
+curl -F "file=@user_data.json" \
+     -F "user_id=tiktok_user" \
+     http://localhost:5000/api/upload/tiktok
+
+# Verify:
+# - Videos parsed
+# - Metadata fetched
+# - Stored in Couchbase with embeddings
+```
+
+**Ask Claude Code**:
+```
+"I'm implementing TikTok file upload provider.
+How should I handle the metadata fetching?"
+```
+
+---
+
+### Task 14: Vue App Setup ⏱️ 2 hours
+
+**Goal**: Get Vue running with router.
+
+**What to build**:
+- `src/main.js`
+- `src/App.vue`
+- `src/router/index.js`
+
+**Success criteria**:
+```bash
+npm run dev
+# Opens http://localhost:3000
+# Shows basic layout
+```
+
+**Ask Claude Code**:
+```
+"Guide me through setting up Vue 3 with Composition API
+and vue-router."
+```
+
+---
+
+### Task 15: Home View (OAuth) ⏱️ 3 hours
+
+**Goal**: OAuth connection buttons + status.
+
+**What to build**:
+- `views/Home.vue`
+- `services/api.js` (Axios client)
+- OAuth flow handling
+
+**Success criteria**:
+- Click "Connect Reddit" → OAuth flow works
+- Click "Connect GitHub" → OAuth flow works
+- Show connection status
+
+**Ask Claude Code**:
+```
+"Help me implement OAuth flow in Vue.
+How do I handle the redirects?"
+```
+
+---
+
+### Task 16: Reddit & GitHub Views ⏱️ 3-4 hours
+
+**Goal**: List views with filtering.
+
+**What to build**:
+- `views/RedditView.vue`
+- `views/GitHubView.vue`
+- `components/ContentList.vue`
+- Filtering dropdowns
+
+**Success criteria**:
+- Shows Reddit saved items
+- Filter by subreddit works
+- Shows GitHub stars
+- Filter by topic works
+
+**Ask Claude Code**:
+```
+"Guide me through building the content list views
+with filtering and pagination."
+```
+
+---
+
+### Task 17: TikTok & Chat Views ⏱️ 4 hours
+
+**Goal**: TikTok upload + Chat interface.
+
+**What to build**:
+- `views/TikTokView.vue` (with file upload)
+- `views/ChatView.vue`
+- `components/ChatMessage.vue`
+
+**Success criteria**:
+- Can upload TikTok data file
+- Shows upload progress
+- Lists TikTok favorites
+- Chat works with source citations
+
+**Ask Claude Code**:
+```
+"Help me implement file upload in Vue and
+create a chat interface with message history."
+```
+
+---
+
+## After All Tasks
+
+### Final Integration Testing
+- [ ] Full OAuth flow (all providers)
+- [ ] Sync all providers
+- [ ] Filter views work
+- [ ] Chat returns good responses
+- [ ] TikTok upload works end-to-end
+
+### Optional Enhancements
+- Add loading spinners
+- Better error messages
+- Sync status indicators
+- Export functionality
+- Advanced filters (date range, score)
+
+---
+
+**Remember**: Each task should be completed fully before moving to the next.
+Test thoroughly, commit working code, then proceed.
+
+---
+
+**Working on a task?** 
+1. Read task description
+2. Check relevant docs
+3. Ask Claude Code for guidance
+4. Write code yourself
+5. Test thoroughly
+6. Mark complete in `claude.md`
